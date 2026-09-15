@@ -12,7 +12,61 @@
  *    what lets us auto-despawn debris on "settled" rather than on a dumb timer.
  */
 
-import RAPIER from '@dimforge/rapier3d-compat';
+/**
+ * Rapier is loaded at runtime rather than through the import map.
+ *
+ * The compat package's ESM entry point has moved between releases and CDNs
+ * disagree about how to resolve a bare package root, so a single hardcoded URL
+ * is a single point of failure that presents as a frozen loading screen. Trying
+ * a short list in order costs nothing on the happy path and turns a dead page
+ * into a one-line console warning when a CDN is down or blocked.
+ *
+ * For production: vendor one of these locally and delete the rest.
+ */
+const RAPIER_SOURCES = [
+  'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js',
+  'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/+esm',
+  'https://unpkg.com/@dimforge/rapier3d-compat@0.14.0/rapier.es.js',
+  'https://esm.sh/@dimforge/rapier3d-compat@0.14.0',
+];
+
+/** @type {any} */
+let RAPIER = null;
+
+/**
+ * @param {(msg:string)=>void} [onProgress]
+ * @returns {Promise<any>} the initialised RAPIER module
+ */
+export async function loadRapier(onProgress = () => {}) {
+  if (RAPIER) return RAPIER;
+
+  const failures = [];
+  for (const url of RAPIER_SOURCES) {
+    try {
+      onProgress(`Loading physics engine from ${new URL(url).host}`);
+      const module = await import(/* @vite-ignore */ url);
+      const candidate = module.default ?? module;
+      if (typeof candidate?.init !== 'function') {
+        throw new Error('module loaded but exposes no init() — wrong entry point');
+      }
+      await candidate.init();
+      if (typeof candidate.World !== 'function') {
+        throw new Error('init() resolved but World is missing — build mismatch');
+      }
+      RAPIER = candidate;
+      return RAPIER;
+    } catch (error) {
+      failures.push(`  ${url}\n    ${error?.message ?? error}`);
+      console.warn(`[physics] source failed: ${url}`, error);
+    }
+  }
+
+  throw new Error(
+    `Could not load Rapier from any known source.\n${failures.join('\n')}\n\n` +
+    `If every entry failed with a network or CORS error, the page is probably ` +
+    `opened over file:// or the CDN is unreachable.`
+  );
+}
 
 /** Collision layers. Membership in the high 16 bits, filter mask in the low 16. */
 export const LAYER = {
@@ -46,11 +100,14 @@ export class PhysicsWorld {
    * @returns {Promise<PhysicsWorld>}
    */
   static async create(opts = {}) {
-    await RAPIER.init();
+    await loadRapier(opts.onProgress);
     return new PhysicsWorld(opts);
   }
 
   constructor({ gravity = { x: 0, y: -22, z: 0 }, timestep = 1 / 60 } = {}) {
+    if (!RAPIER) {
+      throw new Error('PhysicsWorld: call PhysicsWorld.create() — Rapier is not loaded yet');
+    }
     this.RAPIER = RAPIER;
     this.world = new RAPIER.World(gravity);
     this.world.timestep = timestep;

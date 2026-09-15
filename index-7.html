@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Destruction sandbox</title>
+
+<!--
+  No build step. The import map resolves the bare "three" specifier used across
+  src/. Rapier is NOT mapped here: it is loaded at runtime by PhysicsWorld.js
+  with a fallback chain, because the compat package's ESM entry point has moved
+  between releases and a wrong URL here is unrecoverable and silent.
+
+  For production, vendor both locally and pin them.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+  }
+}
+</script>
+
+<style>
+  :root {
+    --ink: #e6e9ea;
+    --ink-dim: #8b9499;
+    --alert: #e0603a;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #10151a;
+    color: var(--ink);
+    font-family: "Inter", "Helvetica Neue", system-ui, sans-serif;
+    overflow: hidden;
+  }
+
+  #viewport { display: block; width: 100%; height: 100%; cursor: crosshair; }
+
+  /* Crosshair: two hairlines and a gap. A filled dot hides exactly the pixels
+     you are trying to aim at. */
+  .reticle {
+    position: fixed;
+    left: 50%; top: 50%;
+    width: 22px; height: 22px;
+    margin: -11px 0 0 -11px;
+    pointer-events: none;
+    opacity: 0.75;
+  }
+  .reticle::before, .reticle::after {
+    content: "";
+    position: absolute;
+    background: var(--ink);
+  }
+  .reticle::before { left: 50%; top: 0; width: 1px; height: 7px; margin-left: -0.5px; box-shadow: 0 15px 0 var(--ink); }
+  .reticle::after  { top: 50%; left: 0; height: 1px; width: 7px; margin-top: -0.5px; box-shadow: 15px 0 0 var(--ink); }
+
+  .telemetry {
+    position: fixed;
+    left: 18px; bottom: 16px;
+    display: grid;
+    grid-template-columns: auto auto;
+    gap: 2px 14px;
+    padding: 12px 16px 12px 0;
+    font-size: 12.5px;
+    line-height: 1.6;
+    pointer-events: none;
+  }
+  .telemetry dt { color: var(--ink-dim); }
+  .telemetry dd {
+    margin: 0;
+    font-variant-numeric: tabular-nums;
+    font-family: "SF Mono", ui-monospace, "Roboto Mono", monospace;
+    text-align: right;
+  }
+
+  .controls {
+    position: fixed;
+    right: 18px; bottom: 16px;
+    max-width: 240px;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--ink-dim);
+    text-align: right;
+    pointer-events: none;
+  }
+  .controls b { color: var(--ink); font-weight: 500; }
+
+  #boot {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    align-content: center;
+    justify-items: center;
+    gap: 10px;
+    padding: 32px;
+    background: #10151a;
+    text-align: center;
+    z-index: 10;
+  }
+  #boot-title {
+    margin: 0;
+    font-size: 19px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  #boot-stage {
+    margin: 0;
+    max-width: 52ch;
+    color: var(--ink-dim);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  #boot-detail {
+    margin: 14px 0 0;
+    max-width: 90ch;
+    max-height: 42vh;
+    overflow: auto;
+    padding: 14px 16px;
+    border-left: 2px solid var(--alert);
+    background: #161c22;
+    color: var(--ink);
+    font-family: "SF Mono", ui-monospace, "Roboto Mono", monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    text-align: left;
+    white-space: pre-wrap;
+    user-select: text;
+  }
+  #boot.is-error #boot-title { color: var(--alert); }
+</style>
+</head>
+<body>
+  <canvas id="viewport"></canvas>
+  <div class="reticle" aria-hidden="true"></div>
+
+  <dl class="telemetry">
+    <dt>Frames per second</dt><dd id="stat-fps">—</dd>
+    <dt>Live shards</dt><dd id="stat-shards">—</dd>
+    <dt>Rigid bodies</dt><dd id="stat-bodies">—</dd>
+    <dt>Tiles destroyed</dt><dd id="stat-tiles">—</dd>
+  </dl>
+
+  <p class="controls">
+    Click to capture the mouse.<br />
+    <b>WASD</b> move, <b>Space</b> / <b>C</b> rise and drop, <b>Shift</b> to sprint.<br />
+    <b>Left click</b> fires the rifle, <b>right click</b> the breaching charge.
+  </p>
+
+  <div id="boot">
+    <h1 id="boot-title">Starting up</h1>
+    <p id="boot-stage">Loading modules.</p>
+    <pre id="boot-detail" hidden></pre>
+  </div>
+
+  <!--
+    Classic script, deliberately not a module. If the module graph itself fails
+    to resolve — a bad import map entry, a blocked CDN, file:// — then nothing
+    inside src/ ever runs and BootScreen cannot report anything. This handler is
+    the only thing still alive in that case.
+  -->
+  <script>
+    (function () {
+      var reported = false;
+      function report(message, hint) {
+        if (reported) return;
+        var root = document.getElementById('boot');
+        if (!root) return;
+        reported = true;
+        root.classList.add('is-error');
+        document.getElementById('boot-title').textContent = 'Startup failed';
+        document.getElementById('boot-stage').textContent =
+          hint || 'The page could not load its modules. Details below.';
+        var detail = document.getElementById('boot-detail');
+        detail.textContent = String(message);
+        detail.hidden = false;
+      }
+
+      window.addEventListener('error', function (e) {
+        if (e.message && /module|import|specifier/i.test(e.message)) {
+          report(e.message + (e.filename ? '\n' + e.filename : ''),
+            'A module failed to resolve. Check the Network tab for a failed CDN request.');
+        }
+      });
+
+      window.addEventListener('unhandledrejection', function (e) {
+        var r = e.reason;
+        report(r && r.stack ? r.stack : String(r));
+      });
+
+      document.addEventListener('DOMContentLoaded', function () {
+        var tag = document.getElementById('entry');
+        if (tag) {
+          tag.addEventListener('error', function () {
+            report('Failed to load ./src/main.js',
+              'The entry module could not be fetched. Confirm the src/ folder sits next to index.html.');
+          });
+        }
+      });
+    })();
+  </script>
+
+  <script id="entry" type="module" src="./src/main.js"></script>
+</body>
+</html>
