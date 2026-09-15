@@ -16,7 +16,6 @@
  */
 
 import * as THREE from 'three';
-import { ConvexGeometry } from 'three/addons/geometries/ConvexGeometry.js';
 
 /** Small deterministic PRNG so patterns are reproducible across sessions/clients. */
 function mulberry32(seed) {
@@ -122,27 +121,80 @@ function inscribedRadius(points, planes) {
   return min;
 }
 
-/** Box-projected UVs so a tiling brick/concrete map still reads on shard faces. */
-function applyBoxUVs(geometry, uvScale = 0.5) {
-  const pos = geometry.attributes.position;
-  const nor = geometry.attributes.normal;
-  const uv = new Float32Array(pos.count * 2);
+/**
+ * Build the cell's surface directly from its bounding planes.
+ *
+ * The obvious route is ConvexGeometry (a general quickhull) over the vertex
+ * set. We do not need it: a cell IS the intersection of known half-spaces, so
+ * every face is already named by a plane. Collecting the vertices that lie on
+ * each plane, sorting them around the face centroid and fan-triangulating gives
+ * the exact surface — with no general hull code, no extra dependency, and exact
+ * flat facet normals, which is what fractured stone should have anyway.
+ *
+ * Dropping the `three/addons/` import also removes one CDN path from startup.
+ */
+function buildCellGeometry(points, planes, uvScale, eps = 1e-4) {
+  const positions = [];
+  const normals = [];
+  const uvs = [];
 
-  for (let i = 0; i < pos.count; i++) {
-    const nx = Math.abs(nor.getX(i));
-    const ny = Math.abs(nor.getY(i));
-    const nz = Math.abs(nor.getZ(i));
-    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+  const u = new THREE.Vector3();
+  const v = new THREE.Vector3();
+  const centre = new THREE.Vector3();
+  const rel = new THREE.Vector3();
 
-    let u, v;
-    if (nx >= ny && nx >= nz)      { u = z; v = y; }
-    else if (ny >= nx && ny >= nz) { u = x; v = z; }
-    else                           { u = x; v = y; }
+  for (const plane of planes) {
+    const face = points.filter((p) => Math.abs(plane.n.dot(p) + plane.d) < eps);
+    if (face.length < 3) continue;
 
-    uv[i * 2]     = u * uvScale;
-    uv[i * 2 + 1] = v * uvScale;
+    centre.set(0, 0, 0);
+    for (const p of face) centre.add(p);
+    centre.divideScalar(face.length);
+
+    // Any tangent will do; pick the axis least aligned with the normal so the
+    // cross product stays well conditioned.
+    const n = plane.n;
+    const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+    if (ax <= ay && ax <= az) u.set(1, 0, 0);
+    else if (ay <= az) u.set(0, 1, 0);
+    else u.set(0, 0, 1);
+    u.addScaledVector(n, -n.dot(u)).normalize();
+    v.crossVectors(n, u); // u x v === n, so ascending angle winds CCW seen from outside
+
+    const ordered = face
+      .map((p) => {
+        rel.subVectors(p, centre);
+        return { p, angle: Math.atan2(rel.dot(v), rel.dot(u)) };
+      })
+      .sort((a, b) => a.angle - b.angle)
+      .map((entry) => entry.p);
+
+    // Box-projected UVs, so a tiling brick or concrete map still reads on the
+    // shard faces. ConvexGeometry produced none; this picks the dominant axis
+    // of the face normal and drops the other two coordinates in.
+    const useYZ = ax >= ay && ax >= az;
+    const useXZ = !useYZ && ay >= az;
+
+    for (let i = 1; i < ordered.length - 1; i++) {
+      const tri = [ordered[0], ordered[i], ordered[i + 1]];
+      for (const p of tri) {
+        positions.push(p.x, p.y, p.z);
+        normals.push(n.x, n.y, n.z);
+        if (useYZ) uvs.push(p.z * uvScale, p.y * uvScale);
+        else if (useXZ) uvs.push(p.x * uvScale, p.z * uvScale);
+        else uvs.push(p.x * uvScale, p.y * uvScale);
+      }
+    }
   }
-  geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+
+  if (positions.length < 9) return null;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(normals), 3));
+  geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2));
+  geometry.computeBoundingSphere();
+  return geometry;
 }
 
 /**
@@ -228,17 +280,14 @@ export function fractureBox(size, opts = {}) {
     const offset = centroidOf(region.points, new THREE.Vector3()).clone();
     const local = region.points.map((p) => p.clone().sub(offset));
 
-    let geometry;
-    try {
-      geometry = new ConvexGeometry(local);
-    } catch (e) {
-      continue; // coplanar point set — skip the cell
-    }
-    if (!geometry.attributes.position || geometry.attributes.position.count < 4) continue;
+    // Shift the cell's planes into the same centred frame as its vertices.
+    const localPlanes = region.planes.map((plane) => ({
+      n: plane.n,
+      d: plane.d + plane.n.dot(offset),
+    }));
 
-    geometry.computeVertexNormals();
-    applyBoxUVs(geometry, uvScale);
-    geometry.computeBoundingSphere();
+    const geometry = buildCellGeometry(local, localPlanes, uvScale);
+    if (!geometry) continue; // degenerate cell
 
     const hullPoints = new Float32Array(local.length * 3);
     for (let i = 0; i < local.length; i++) {
